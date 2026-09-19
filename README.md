@@ -17,9 +17,6 @@ The scripts use previously extracted cortical thickness measurements and do not 
 
 ## Files
 
-- analyze_pediatric_35.py: analyzes the 35-subject pediatric cohort
-- analyze_adult_67.py: analyzes the 67-subject adult cohort
-- pediatric_subject_measurements.csv: contains pediatric subject-level cortical thickness measurements
-- pediatric_statistical_results.csv: contains pediatric statistical comparison results
-- adult_subject_measurements.csv: contains adult subject-level cortical thickness measurements
-- adult_statistical_results.csv: contains adult statistical comparison results
+- analyze_pediatric_35.py: analyzes the 35-subject pediatric cohort and prints graphs
+- analyze_adult_67.py: analyzes the 67-subject adult cohort and prints graphs
+
