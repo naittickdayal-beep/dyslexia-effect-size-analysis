@@ -1,8 +1,3 @@
-"""Read-only extraction and full available-cohort statistical analysis.
-
-Run with Python + NumPy + SciPy. Source archives are never modified.
-Optional --deps supplies a task-local Python dependency directory.
-"""
 import argparse
 import collections
 import csv
@@ -16,160 +11,682 @@ import tarfile
 import zipfile
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--root', default='C:/dyslexia_project')
-parser.add_argument('--metadata', default='work')
-parser.add_argument('--output', default='outputs')
-parser.add_argument('--deps')
+parser.add_argument("--root", default="C:/dyslexia_project")
+parser.add_argument("--metadata", default="work")
+parser.add_argument("--output", default="outputs")
+parser.add_argument("--deps")
 args = parser.parse_args()
+
 if args.deps:
     sys.path.insert(0, str(Path(args.deps).resolve()))
+
+import matplotlib.pyplot as plt
 import numpy as np
 import scipy
 from scipy import stats
 
-root, out = Path(args.root), Path(args.output)
-out.mkdir(parents=True, exist_ok=True)
-datasets = ['ds003126', 'ds005577']
-metadata = {d: {r['participant_id']: r for r in csv.DictReader(
-    open(Path(args.metadata) / f'{d}-participants.tsv'), delimiter='\t')}
-    for d in datasets}
-roi_map = {'parstriangularis': 'pars_triangularis_mm',
-           'fusiform': 'fusiform_mm', 'insula': 'insula_mm'}
-records = collections.defaultdict(list)
+root = Path(args.root)
+metadata_dir = Path(args.metadata)
+output_dir = Path(args.output)
+output_dir.mkdir(parents=True, exist_ok=True)
+
+dataset = "ds005577"
+
+with open(metadata_dir / f"{dataset}-participants.tsv", encoding="utf-8") as f:
+    metadata = {
+        row["participant_id"]: row
+        for row in csv.DictReader(f, delimiter="\t")
+    }
+
+roi_names = {
+    "parstriangularis": "pars_triangularis_mm",
+    "fusiform": "fusiform_mm",
+    "insula": "insula_mm"
+}
+
+subject_files = collections.defaultdict(list)
 audit = []
 source_state = {}
 
-def parse_stats(text):
-    header = next((l.split()[2:] for l in text.splitlines()
-                   if l.startswith('# ColHeaders')), [])
-    if 'ThickAvg' not in header:
-        return {}
-    values = {}
+
+def read_stats(text):
+    header = []
+
     for line in text.splitlines():
-        if not line.strip() or line.startswith('#'):
+        if line.startswith("# ColHeaders"):
+            header = line.split()[2:]
+            break
+
+    if "ThickAvg" not in header:
+        return {}
+
+    values = {}
+
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
             continue
+
         row = dict(zip(header, line.split()))
-        if row.get('StructName') in roi_map:
-            key = roi_map[row['StructName']]
+        region = row.get("StructName")
+
+        if region in roi_names:
+            key = roi_names[region]
+
             if key in values:
-                raise ValueError('Duplicate region')
-            values[key] = float(row['ThickAvg'])
+                raise ValueError(f"Duplicate region: {region}")
+
+            values[key] = float(row["ThickAvg"])
+
     return values
 
-for path in sorted(root.rglob('*')):
-    if not path.is_file() or not path.name.endswith(('.zip', '.tar.gz')):
+
+for path in sorted(root.rglob("*")):
+    if not path.is_file():
         continue
-    match = re.match(r'(sub-[^_]+)', path.name)
+
+    if not path.name.endswith((".zip", ".tar.gz")):
+        continue
+
+    match = re.match(r"(sub-[^_]+)", path.name)
+
     if not match:
         continue
-    sid = match[1]
-    matches = [d for d in datasets if sid in metadata[d]]
-    if not matches or 'GPU_SEG_ONLY' in path.name:
+
+    subject_id = match.group(1)
+
+    if subject_id not in metadata:
         continue
-    assert len(matches) == 1
-    d = matches[0]
-    source_state[str(path)] = (path.stat().st_size, path.stat().st_mtime_ns)
-    texts = {}
-    if path.suffix == '.zip':
-        with zipfile.ZipFile(path) as z:
-            for n in z.namelist():
-                if n.endswith('/lh.aparc.DKTatlas.mapped.stats'):
-                    texts[n] = z.read(n)
+
+    if "GPU_SEG_ONLY" in path.name:
+        continue
+
+    source_state[str(path)] = (
+        path.stat().st_size,
+        path.stat().st_mtime_ns
+    )
+
+    stats_files = {}
+
+    if path.name.endswith(".zip"):
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if name.endswith("/lh.aparc.DKTatlas.mapped.stats"):
+                    stats_files[name] = archive.read(name)
+
     else:
-        with tarfile.open(path, 'r|gz') as t:
-            for m in t:
-                if m.isfile() and m.name.endswith('/lh.aparc.DKTatlas.mapped.stats'):
-                    texts[m.name] = t.extractfile(m).read()
-    if not texts:
-        audit.append(dict(dataset=d, participant_id=sid, archive=path.name,
-                          status='No matching DKT left-hemisphere stats; archive not used'))
-    for name, content in texts.items():
-        values = parse_stats(content.decode('utf-8', 'replace'))
-        if len(values) != 3 or not all(math.isfinite(v) and v > 0 for v in values.values()):
-            raise ValueError(f'Invalid primary measurements: {path} {name}')
-        group_raw = metadata[d][sid]['group']
-        group = {'DL': 'dyslexia', 'TD': 'control'}.get(group_raw, group_raw)
-        if group not in ('dyslexia', 'control'):
+        with tarfile.open(path, "r|gz") as archive:
+            for member in archive:
+                if (
+                    member.isfile()
+                    and member.name.endswith(
+                        "/lh.aparc.DKTatlas.mapped.stats"
+                    )
+                ):
+                    file_obj = archive.extractfile(member)
+
+                    if file_obj is not None:
+                        stats_files[member.name] = file_obj.read()
+
+    if not stats_files:
+        audit.append({
+            "participant_id": subject_id,
+            "archive": path.name,
+            "status": "No usable left-hemisphere DKT statistics found"
+        })
+        continue
+
+    for stats_name, content in stats_files.items():
+        values = read_stats(
+            content.decode("utf-8", errors="replace")
+        )
+
+        if len(values) != 3:
+            raise ValueError(
+                f"Missing cortical thickness measurement: "
+                f"{path.name}, {stats_name}"
+            )
+
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in values.values()
+        ):
+            raise ValueError(
+                f"Invalid cortical thickness measurement: "
+                f"{path.name}, {stats_name}"
+            )
+
+        group_raw = metadata[subject_id]["group"]
+
+        group = {
+            "DL": "dyslexia",
+            "TD": "control"
+        }.get(group_raw, group_raw)
+
+        if group not in ("dyslexia", "control"):
             continue
-        records[(d, sid)].append(dict(dataset=d, participant_id=sid, group=group,
-            age=int(metadata[d][sid]['age']), sex=metadata[d][sid]['sex'],
-            **values, source_archive=str(path), source_stats=name,
-            stats_sha256=hashlib.sha256(content).hexdigest(),
-            label_source=f'https://raw.githubusercontent.com/OpenNeuroDatasets/{d}/master/participants.tsv'))
+
+        age_value = metadata[subject_id].get("age", "")
+
+        try:
+            age = float(age_value)
+        except ValueError:
+            age = age_value
+
+        subject_files[subject_id].append({
+            "participant_id": subject_id,
+            "group": group,
+            "age": age,
+            "sex": metadata[subject_id].get("sex", ""),
+            **values,
+            "source_archive": str(path),
+            "source_stats": stats_name,
+            "stats_sha256": hashlib.sha256(content).hexdigest(),
+            "label_source":
+                f"https://raw.githubusercontent.com/"
+                f"OpenNeuroDatasets/{dataset}/master/participants.tsv"
+        })
+
 
 subjects = []
-for (d, sid), candidates in sorted(records.items()):
-    candidates.sort(key=lambda r: (' (1)' in r['source_archive'], r['source_archive']))
-    row = candidates[0].copy()
-    for other in candidates[1:]:
-        assert all(row[k] == other[k] for k in roi_map.values()), f'Conflicting thickness: {sid}'
-        audit.append(dict(dataset=d, participant_id=sid, archive=Path(other['source_archive']).name,
-                          status='Duplicate subject: all three ROI values agree; counted once'))
-    row['network_ratio'] = row['pars_triangularis_mm'] / math.sqrt(row['fusiform_mm'] * row['insula_mm'])
-    row['statistical_exclusion'] = 'none'
-    row['qc_status'] = 'Complete positive measurements; visual surface QC not performed'
-    subjects.append(row)
 
-def holm(ps):
-    order = np.argsort(ps)
-    result = np.empty(len(ps))
-    running = 0.
+for subject_id, candidates in sorted(subject_files.items()):
+    candidates.sort(
+        key=lambda row: (
+            " (1)" in row["source_archive"],
+            row["source_archive"]
+        )
+    )
+
+    subject = candidates[0].copy()
+
+    for duplicate in candidates[1:]:
+        same_values = all(
+            subject[key] == duplicate[key]
+            for key in roi_names.values()
+        )
+
+        if not same_values:
+            raise ValueError(
+                f"Conflicting cortical thickness values for {subject_id}"
+            )
+
+        audit.append({
+            "participant_id": subject_id,
+            "archive": Path(
+                duplicate["source_archive"]
+            ).name,
+            "status": "Duplicate subject with matching ROI values"
+        })
+
+    subject["network_ratio"] = (
+        subject["pars_triangularis_mm"]
+        / math.sqrt(
+            subject["fusiform_mm"]
+            * subject["insula_mm"]
+        )
+    )
+
+    subjects.append(subject)
+
+
+n_dyslexia = sum(
+    subject["group"] == "dyslexia"
+    for subject in subjects
+)
+
+n_control = sum(
+    subject["group"] == "control"
+    for subject in subjects
+)
+
+if len(subjects) != 67:
+    raise ValueError(
+        f"Expected 67 adult subjects, found {len(subjects)}"
+    )
+
+if n_dyslexia != 32:
+    raise ValueError(
+        f"Expected 32 dyslexic adults, found {n_dyslexia}"
+    )
+
+if n_control != 35:
+    raise ValueError(
+        f"Expected 35 control adults, found {n_control}"
+    )
+
+
+def holm_adjust(p_values):
+    order = np.argsort(p_values)
+    adjusted = np.empty(len(p_values))
+    previous = 0.0
+
     for rank, index in enumerate(order):
-        running = max(running, min(1., (len(ps) - rank) * ps[index]))
-        result[index] = running
-    return result.tolist()
+        value = min(
+            1.0,
+            (len(p_values) - rank) * p_values[index]
+        )
+
+        previous = max(previous, value)
+        adjusted[index] = previous
+
+    return adjusted.tolist()
+
 
 rng = np.random.default_rng(20260919)
-results, welch = [], []
-features = list(roi_map.values()) + ['network_ratio']
-for d in datasets:
-    rows = [r for r in subjects if r['dataset'] == d]
-    for feature in features:
-        x = np.array([r[feature] for r in rows if r['group'] == 'dyslexia'])
-        y = np.array([r[feature] for r in rows if r['group'] == 'control'])
-        test = stats.mannwhitneyu(x, y, alternative='two-sided', method='asymptotic', use_continuity=True)
-        # Independent pair-count check for direction and ties.
-        u_pairs = float(np.sum(x[:, None] > y) + .5 * np.sum(x[:, None] == y))
-        assert math.isclose(test.statistic, u_pairs, abs_tol=1e-10)
-        rb = 2 * test.statistic / (len(x)*len(y)) - 1
-        bx = rng.choice(x, (10000, len(x)), replace=True)
-        by = rng.choice(y, (10000, len(y)), replace=True)
-        bu = stats.mannwhitneyu(bx, by, axis=1, method='asymptotic').statistic
-        ci = np.quantile(2 * bu / (len(x)*len(y)) - 1, [.025, .975])
-        record = dict(dataset=d, cohort='Pediatric' if d == 'ds003126' else 'Adult',
-            measurement=feature, units='dimensionless' if feature=='network_ratio' else 'mm',
-            n_dyslexia=len(x), n_control=len(y), U_dyslexia=float(test.statistic),
-            p_two_sided=float(test.pvalue), rank_biserial=float(rb),
-            rank_biserial_CI_low=float(ci[0]), rank_biserial_CI_high=float(ci[1]))
-        for group, a in [('dyslexia',x),('control',y)]:
-            q1, med, q3 = np.quantile(a, [.25,.5,.75], method='linear')
-            record.update({group+'_median':float(med), group+'_Q1':float(q1),
-                group+'_Q3':float(q3), group+'_IQR':float(q3-q1)})
-        results.append(record)
-        if feature == 'network_ratio':
-            t = stats.ttest_ind(x, y, equal_var=False, alternative='two-sided')
-            ci_t = t.confidence_interval(.95)
-            welch.append(dict(dataset=d, n_dyslexia=len(x), n_control=len(y),
-                t=float(t.statistic), df=float(t.df), p_two_sided=float(t.pvalue),
-                mean_difference_dyslexia_minus_control=float(x.mean()-y.mean()),
-                CI_low=float(ci_t.low), CI_high=float(ci_t.high)))
-for r,p in zip(results,holm([r['p_two_sided'] for r in results])):
-    r['p_Holm_8_tests'] = p
-for r,p in zip(welch,holm([r['p_two_sided'] for r in welch])):
-    r['p_Holm_2_tests'] = p
 
-def write_csv(name, rows):
-    with open(out/name, 'w', newline='', encoding='utf-8') as f:
-        w=csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
+features = [
+    "pars_triangularis_mm",
+    "fusiform_mm",
+    "insula_mm",
+    "network_ratio"
+]
 
-write_csv('full-cohort-comparisons.csv', results)
-write_csv('full-cohort-subject-measurements.csv', subjects)
-write_csv('full-cohort-ratio-welch-tests.csv', welch)
-write_csv('archive-resolution-audit.csv', audit)
-assert all((Path(p).stat().st_size,Path(p).stat().st_mtime_ns)==v for p,v in source_state.items())
-payload = dict(results=results, subjects=subjects, welch=welch, audit=audit,
-    numpy_version=np.__version__, scipy_version=scipy.__version__, seed=20260919,
-    bootstrap_resamples=10000, statistical_exclusions=[], source_archives_unchanged=True)
-(out/'full-cohort-results.json').write_text(json.dumps(payload,indent=2),encoding='utf-8')
-print(json.dumps(dict(results=results,welch=welch,audit=audit),indent=2))
+results = []
 
+for feature in features:
+    dyslexia = np.array([
+        subject[feature]
+        for subject in subjects
+        if subject["group"] == "dyslexia"
+    ])
+
+    control = np.array([
+        subject[feature]
+        for subject in subjects
+        if subject["group"] == "control"
+    ])
+
+    test = stats.mannwhitneyu(
+        dyslexia,
+        control,
+        alternative="two-sided",
+        method="asymptotic",
+        use_continuity=True
+    )
+
+    u_check = float(
+        np.sum(dyslexia[:, None] > control)
+        + 0.5 * np.sum(dyslexia[:, None] == control)
+    )
+
+    if not math.isclose(
+        test.statistic,
+        u_check,
+        abs_tol=1e-10
+    ):
+        raise ValueError(
+            f"Mann-Whitney U check failed for {feature}"
+        )
+
+    rank_biserial = (
+        2 * test.statistic
+        / (len(dyslexia) * len(control))
+        - 1
+    )
+
+    bootstrap_dyslexia = rng.choice(
+        dyslexia,
+        size=(10000, len(dyslexia)),
+        replace=True
+    )
+
+    bootstrap_control = rng.choice(
+        control,
+        size=(10000, len(control)),
+        replace=True
+    )
+
+    bootstrap_u = stats.mannwhitneyu(
+        bootstrap_dyslexia,
+        bootstrap_control,
+        axis=1,
+        method="asymptotic"
+    ).statistic
+
+    bootstrap_effects = (
+        2 * bootstrap_u
+        / (len(dyslexia) * len(control))
+        - 1
+    )
+
+    ci_low, ci_high = np.quantile(
+        bootstrap_effects,
+        [0.025, 0.975]
+    )
+
+    dyslexia_q1, dyslexia_median, dyslexia_q3 = np.quantile(
+        dyslexia,
+        [0.25, 0.5, 0.75]
+    )
+
+    control_q1, control_median, control_q3 = np.quantile(
+        control,
+        [0.25, 0.5, 0.75]
+    )
+
+    results.append({
+        "measurement": feature,
+        "units":
+            "dimensionless"
+            if feature == "network_ratio"
+            else "mm",
+        "n_dyslexia": len(dyslexia),
+        "n_control": len(control),
+        "U_dyslexia": float(test.statistic),
+        "p_two_sided": float(test.pvalue),
+        "rank_biserial": float(rank_biserial),
+        "rank_biserial_CI_low": float(ci_low),
+        "rank_biserial_CI_high": float(ci_high),
+        "dyslexia_median": float(dyslexia_median),
+        "dyslexia_Q1": float(dyslexia_q1),
+        "dyslexia_Q3": float(dyslexia_q3),
+        "dyslexia_IQR": float(
+            dyslexia_q3 - dyslexia_q1
+        ),
+        "control_median": float(control_median),
+        "control_Q1": float(control_q1),
+        "control_Q3": float(control_q3),
+        "control_IQR": float(
+            control_q3 - control_q1
+        )
+    })
+
+
+adjusted = holm_adjust([
+    result["p_two_sided"]
+    for result in results
+])
+
+for result, p_value in zip(results, adjusted):
+    result["p_Holm_4_tests"] = p_value
+
+
+ratio_dyslexia = np.array([
+    subject["network_ratio"]
+    for subject in subjects
+    if subject["group"] == "dyslexia"
+])
+
+ratio_control = np.array([
+    subject["network_ratio"]
+    for subject in subjects
+    if subject["group"] == "control"
+])
+
+welch_test = stats.ttest_ind(
+    ratio_dyslexia,
+    ratio_control,
+    equal_var=False,
+    alternative="two-sided"
+)
+
+welch_ci = welch_test.confidence_interval(0.95)
+
+welch = [{
+    "n_dyslexia": len(ratio_dyslexia),
+    "n_control": len(ratio_control),
+    "t": float(welch_test.statistic),
+    "df": float(welch_test.df),
+    "p_two_sided": float(welch_test.pvalue),
+    "mean_difference_dyslexia_minus_control":
+        float(
+            ratio_dyslexia.mean()
+            - ratio_control.mean()
+        ),
+    "CI_low": float(welch_ci.low),
+    "CI_high": float(welch_ci.high)
+}]
+
+
+def write_csv(filename, rows):
+    if not rows:
+        return
+
+    with open(
+        output_dir / filename,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(rows[0].keys())
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+write_csv(
+    "adult-statistical-results.csv",
+    results
+)
+
+write_csv(
+    "adult-subject-measurements.csv",
+    subjects
+)
+
+write_csv(
+    "adult-ratio-welch-test.csv",
+    welch
+)
+
+write_csv(
+    "adult-archive-audit.csv",
+    audit
+)
+
+
+result_lookup = {
+    result["measurement"]: result
+    for result in results
+}
+
+figure_features = [
+    (
+        "pars_triangularis_mm",
+        "A. Pars triangularis",
+        "Cortical thickness (mm)"
+    ),
+    (
+        "fusiform_mm",
+        "B. Fusiform",
+        "Cortical thickness (mm)"
+    ),
+    (
+        "insula_mm",
+        "C. Insula",
+        "Cortical thickness (mm)"
+    ),
+    (
+        "network_ratio",
+        "D. Network ratio",
+        "Network ratio"
+    )
+]
+
+fig, axes = plt.subplots(
+    2,
+    2,
+    figsize=(10, 9)
+)
+
+axes = axes.flatten()
+
+for ax, (feature, title, ylabel) in zip(
+    axes,
+    figure_features
+):
+    control = np.array([
+        subject[feature]
+        for subject in subjects
+        if subject["group"] == "control"
+    ])
+
+    dyslexia = np.array([
+        subject[feature]
+        for subject in subjects
+        if subject["group"] == "dyslexia"
+    ])
+
+    ax.boxplot(
+        [control, dyslexia],
+        positions=[1, 2],
+        widths=0.46,
+        showfliers=False,
+        medianprops={"linewidth": 1.7},
+        boxprops={"linewidth": 1.2},
+        whiskerprops={"linewidth": 1.2},
+        capprops={"linewidth": 1.2}
+    )
+
+    control_jitter = np.linspace(
+        -0.08,
+        0.08,
+        len(control)
+    )
+
+    dyslexia_jitter = np.linspace(
+        -0.08,
+        0.08,
+        len(dyslexia)
+    )
+
+    ax.scatter(
+        np.ones(len(control)) + control_jitter,
+        control,
+        s=26,
+        alpha=0.7,
+        marker="o",
+        zorder=3
+    )
+
+    ax.scatter(
+        np.ones(len(dyslexia)) * 2 + dyslexia_jitter,
+        dyslexia,
+        s=26,
+        alpha=0.7,
+        marker="s",
+        zorder=3
+    )
+
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels([
+        "Control",
+        "Dyslexia"
+    ])
+
+    ax.set_ylabel(ylabel)
+
+    ax.set_title(
+        title,
+        loc="left",
+        fontweight="bold"
+    )
+
+    result = result_lookup[feature]
+
+    p_value = result["p_two_sided"]
+    effect = result["rank_biserial"]
+
+    if p_value < 0.0001:
+        p_text = "p < 0.0001"
+    else:
+        p_text = f"p = {p_value:.4f}"
+
+    ax.text(
+        0.97,
+        0.97,
+        f"{p_text}\n"
+        + r"$r_{rb}$"
+        + f" = {effect:.3f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(
+        axis="y",
+        alpha=0.2
+    )
+
+
+fig.tight_layout(
+    h_pad=2.5,
+    w_pad=2.5
+)
+
+figure_path = (
+    output_dir
+    / "Figure2_Adult_Comparisons.png"
+)
+
+fig.savefig(
+    figure_path,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.close(fig)
+
+
+for path, original_state in source_state.items():
+    current_state = (
+        Path(path).stat().st_size,
+        Path(path).stat().st_mtime_ns
+    )
+
+    if current_state != original_state:
+        raise RuntimeError(
+            f"Source archive changed: {path}"
+        )
+
+
+payload = {
+    "dataset": dataset,
+    "cohort": {
+        "total": len(subjects),
+        "dyslexia": n_dyslexia,
+        "control": n_control
+    },
+    "results": results,
+    "subjects": subjects,
+    "welch": welch,
+    "audit": audit,
+    "numpy_version": np.__version__,
+    "scipy_version": scipy.__version__,
+    "seed": 20260919,
+    "bootstrap_resamples": 10000,
+    "source_archives_unchanged": True
+}
+
+(
+    output_dir
+    / "adult-analysis-results.json"
+).write_text(
+    json.dumps(payload, indent=2),
+    encoding="utf-8"
+)
+
+
+print(
+    f"Adult cohort: "
+    f"{n_dyslexia} dyslexic, "
+    f"{n_control} control, "
+    f"{len(subjects)} total"
+)
+
+print(
+    f"Figure saved to "
+    f"{figure_path}"
+)
+
+print(
+    json.dumps(
+        results,
+        indent=2
+    )
+)
